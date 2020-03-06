@@ -12,6 +12,8 @@
 extern crate vm_device;
 
 use crate::config::ConsoleOutputMode;
+#[cfg(feature = "pci_support")]
+use crate::config::DeviceConfig;
 use crate::config::{DiskConfig, NetConfig, VmConfig};
 use crate::interrupt::{
     KvmLegacyUserspaceInterruptManager, KvmMsiInterruptManager, KvmRoutingEntry,
@@ -22,7 +24,7 @@ use acpi_tables::{aml, aml::Aml};
 #[cfg(feature = "acpi")]
 use arch::layout;
 use arch::layout::{APIC_START, IOAPIC_SIZE, IOAPIC_START};
-use devices::{ioapic, HotPlugNotificationFlags};
+use devices::{ioapic, BusDevice, HotPlugNotificationFlags};
 use kvm_ioctls::*;
 use libc::O_TMPFILE;
 use libc::TIOCGWINSZ;
@@ -37,8 +39,6 @@ use std::io::{self, sink, stdout};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::result;
-#[cfg(feature = "pci_support")]
-use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 #[cfg(feature = "pci_support")]
@@ -209,6 +209,9 @@ pub enum DeviceManagerError {
 
     /// Failed to spawn the block backend
     SpawnBlockBackend(io::Error),
+
+    /// Missing PCI bus.
+    NoPciBus,
 }
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
 
@@ -424,14 +427,45 @@ pub struct DeviceManager {
     // The virtio devices on the system
     virtio_devices: Vec<(VirtioDeviceArc, bool)>,
 
+    // List of bus devices
+    // Let the DeviceManager keep strong references to the BusDevice devices.
+    // This allows the IO and MMIO buses to be provided with Weak references,
+    // which prevents cyclic dependencies.
+    bus_devices: Vec<Arc<Mutex<dyn BusDevice>>>,
+
     // The path to the VMM for self spawning
     vmm_path: PathBuf,
 
     // Backends that have been spawned
     vhost_user_backends: Vec<ActivatedBackend>,
+
+    // Keep a reference to the PCI bus
+    #[cfg(feature = "pci_support")]
+    pci_bus: Option<Arc<Mutex<PciBus>>>,
+
+    // MSI Interrupt Manager
+    #[cfg(feature = "pci_support")]
+    msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
+
+    // VFIO KVM device
+    #[cfg(feature = "pci_support")]
+    kvm_device_fd: Option<Arc<DeviceFd>>,
+
+    // Paravirtualized IOMMU
+    #[cfg(feature = "pci_support")]
+    iommu_device: Option<Arc<Mutex<vm_virtio::Iommu>>>,
+
+    // Bitmap of PCI devices to hotplug.
+    #[cfg(feature = "pci_support")]
+    pci_devices_up: u32,
+
+    // Bitmap of PCI devices to hotunplug.
+    #[cfg(feature = "pci_support")]
+    pci_devices_down: u32,
 }
 
 impl DeviceManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vm_fd: Arc<VmFd>,
         config: Arc<Mutex<VmConfig>>,
@@ -441,11 +475,9 @@ impl DeviceManager {
         reset_evt: &EventFd,
         vmm_path: PathBuf,
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
-        let io_bus = devices::Bus::new();
-        let mmio_bus = devices::Bus::new();
-
         let mut virtio_devices: Vec<(Arc<Mutex<dyn vm_virtio::VirtioDevice>>, bool)> = Vec::new();
         let migratable_devices: Vec<Arc<Mutex<dyn Migratable>>> = Vec::new();
+        let mut bus_devices: Vec<Arc<Mutex<dyn BusDevice>>> = Vec::new();
         let mut _mmap_regions = Vec::new();
 
         #[allow(unused_mut)]
@@ -453,8 +485,8 @@ impl DeviceManager {
 
         let address_manager = Arc::new(AddressManager {
             allocator,
-            io_bus: Arc::new(io_bus),
-            mmio_bus: Arc::new(mmio_bus),
+            io_bus: Arc::new(devices::Bus::new()),
+            mmio_bus: Arc::new(devices::Bus::new()),
             vm_fd: vm_fd.clone(),
         });
 
@@ -480,6 +512,7 @@ impl DeviceManager {
 
         let ioapic =
             DeviceManager::add_ioapic(&address_manager, Arc::clone(&msi_interrupt_manager))?;
+        bus_devices.push(Arc::clone(&ioapic) as Arc<Mutex<dyn BusDevice>>);
 
         // Now we can create the legacy interrupt manager, which needs the freshly
         // formed IOAPIC device.
@@ -502,7 +535,7 @@ impl DeviceManager {
             .map_err(DeviceManagerError::BusError)?;
 
         let mut device_manager = DeviceManager {
-            address_manager,
+            address_manager: Arc::clone(&address_manager),
             console: Arc::new(Console::default()),
             ioapic: Some(ioapic),
             _mmap_regions,
@@ -513,8 +546,21 @@ impl DeviceManager {
             migratable_devices,
             memory_manager,
             virtio_devices: Vec::new(),
+            bus_devices,
             vmm_path,
             vhost_user_backends: Vec::new(),
+            #[cfg(feature = "pci_support")]
+            pci_bus: None,
+            #[cfg(feature = "pci_support")]
+            msi_interrupt_manager: Arc::clone(&msi_interrupt_manager),
+            #[cfg(feature = "pci_support")]
+            kvm_device_fd: None,
+            #[cfg(feature = "pci_support")]
+            iommu_device: None,
+            #[cfg(feature = "pci_support")]
+            pci_devices_up: 0,
+            #[cfg(feature = "pci_support")]
+            pci_devices_down: 0,
         };
 
         device_manager
@@ -536,37 +582,60 @@ impl DeviceManager {
         virtio_devices.append(&mut device_manager.make_virtio_devices()?);
 
         if cfg!(feature = "pci_support") {
-            device_manager.add_pci_devices(virtio_devices.clone(), &msi_interrupt_manager)?;
+            device_manager.add_pci_devices(virtio_devices.clone())?;
         } else if cfg!(feature = "mmio_support") {
             device_manager.add_mmio_devices(virtio_devices.clone(), &legacy_interrupt_manager)?;
         }
 
         device_manager.virtio_devices = virtio_devices;
 
-        Ok(Arc::new(Mutex::new(device_manager)))
+        let device_manager = Arc::new(Mutex::new(device_manager));
+
+        #[cfg(feature = "acpi")]
+        address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_io_addresses(Some(GuestAddress(0xae00)), 0x10, None)
+            .ok_or(DeviceManagerError::AllocateIOPort)?;
+
+        #[cfg(feature = "acpi")]
+        address_manager
+            .io_bus
+            .insert(
+                Arc::clone(&device_manager) as Arc<Mutex<dyn BusDevice>>,
+                0xae00,
+                0x10,
+            )
+            .map_err(DeviceManagerError::BusError)?;
+
+        Ok(device_manager)
     }
 
     #[allow(unused_variables)]
     fn add_pci_devices(
         &mut self,
         virtio_devices: Vec<(Arc<Mutex<dyn vm_virtio::VirtioDevice>>, bool)>,
-        interrupt_manager: &Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
     ) -> DeviceManagerResult<()> {
         #[cfg(feature = "pci_support")]
         {
             let pci_root = PciRoot::new(None);
             let mut pci_bus = PciBus::new(
                 pci_root,
-                Arc::downgrade(&self.address_manager) as Weak<dyn DeviceRelocation>,
+                Arc::clone(&self.address_manager) as Arc<dyn DeviceRelocation>,
             );
 
-            let (mut iommu_device, iommu_mapping) = if self.config.lock().unwrap().iommu {
+            let (iommu_device, iommu_mapping) = if self.config.lock().unwrap().iommu {
                 let (device, mapping) =
                     vm_virtio::Iommu::new().map_err(DeviceManagerError::CreateVirtioIommu)?;
+                let device = Arc::new(Mutex::new(device));
+                self.iommu_device = Some(Arc::clone(&device));
                 (Some(device), Some(mapping))
             } else {
                 (None, None)
             };
+
+            let interrupt_manager = Arc::clone(&self.msi_interrupt_manager);
 
             let mut iommu_attached_devices = Vec::new();
 
@@ -578,7 +647,7 @@ impl DeviceManager {
                 };
 
                 let virtio_iommu_attach_dev =
-                    self.add_virtio_pci_device(device, &mut pci_bus, mapping, interrupt_manager)?;
+                    self.add_virtio_pci_device(device, &mut pci_bus, mapping, &interrupt_manager)?;
 
                 if let Some(dev_id) = virtio_iommu_attach_dev {
                     iommu_attached_devices.push(dev_id);
@@ -586,31 +655,33 @@ impl DeviceManager {
             }
 
             let mut vfio_iommu_device_ids =
-                self.add_vfio_devices(&mut pci_bus, &mut iommu_device, interrupt_manager)?;
+                self.add_vfio_devices(&mut pci_bus, &interrupt_manager)?;
 
             iommu_attached_devices.append(&mut vfio_iommu_device_ids);
 
-            if let Some(mut iommu_device) = iommu_device {
-                iommu_device.attach_pci_devices(0, iommu_attached_devices);
+            if let Some(iommu_device) = iommu_device {
+                iommu_device
+                    .lock()
+                    .unwrap()
+                    .attach_pci_devices(0, iommu_attached_devices);
 
                 // Because we determined the virtio-iommu b/d/f, we have to
                 // add the device to the PCI topology now. Otherwise, the
                 // b/d/f won't match the virtio-iommu device as expected.
-                self.add_virtio_pci_device(
-                    Arc::new(Mutex::new(iommu_device)),
-                    &mut pci_bus,
-                    &None,
-                    interrupt_manager,
-                )?;
+                self.add_virtio_pci_device(iommu_device, &mut pci_bus, &None, &interrupt_manager)?;
             }
 
             let pci_bus = Arc::new(Mutex::new(pci_bus));
-            let pci_config_io = Arc::new(Mutex::new(PciConfigIo::new(pci_bus.clone())));
+            let pci_config_io = Arc::new(Mutex::new(PciConfigIo::new(Arc::clone(&pci_bus))));
+            self.bus_devices
+                .push(Arc::clone(&pci_config_io) as Arc<Mutex<dyn BusDevice>>);
             self.address_manager
                 .io_bus
                 .insert(pci_config_io, 0xcf8, 0x8)
                 .map_err(DeviceManagerError::BusError)?;
-            let pci_config_mmio = Arc::new(Mutex::new(PciConfigMmio::new(pci_bus)));
+            let pci_config_mmio = Arc::new(Mutex::new(PciConfigMmio::new(Arc::clone(&pci_bus))));
+            self.bus_devices
+                .push(Arc::clone(&pci_config_mmio) as Arc<Mutex<dyn BusDevice>>);
             self.address_manager
                 .mmio_bus
                 .insert(
@@ -619,6 +690,8 @@ impl DeviceManager {
                     arch::layout::PCI_MMCONFIG_SIZE,
                 )
                 .map_err(DeviceManagerError::BusError)?;
+
+            self.pci_bus = Some(pci_bus);
         }
 
         Ok(())
@@ -679,6 +752,9 @@ impl DeviceManager {
             exit_evt, reset_evt,
         )));
 
+        self.bus_devices
+            .push(Arc::clone(&acpi_device) as Arc<Mutex<dyn BusDevice>>);
+
         self.address_manager
             .allocator
             .lock()
@@ -710,6 +786,9 @@ impl DeviceManager {
             ged_irq,
         )));
 
+        self.bus_devices
+            .push(Arc::clone(&ged_device) as Arc<Mutex<dyn BusDevice>>);
+
         self.address_manager
             .allocator
             .lock()
@@ -727,6 +806,9 @@ impl DeviceManager {
     fn add_legacy_devices(&mut self, reset_evt: EventFd) -> DeviceManagerResult<()> {
         // Add a shutdown device (i8042)
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(reset_evt)));
+
+        self.bus_devices
+            .push(Arc::clone(&i8042) as Arc<Mutex<dyn BusDevice>>);
 
         self.address_manager
             .io_bus
@@ -752,6 +834,9 @@ impl DeviceManager {
                 mem_below_4g,
                 mem_above_4g,
             )));
+
+            self.bus_devices
+                .push(Arc::clone(&cmos) as Arc<Mutex<dyn BusDevice>>);
 
             self.address_manager
                 .io_bus
@@ -790,6 +875,9 @@ impl DeviceManager {
                 interrupt_group,
                 serial_writer,
             )));
+
+            self.bus_devices
+                .push(Arc::clone(&serial) as Arc<Mutex<dyn BusDevice>>);
 
             self.address_manager
                 .allocator
@@ -1306,77 +1394,98 @@ impl DeviceManager {
     }
 
     #[cfg(feature = "pci_support")]
+    fn add_vfio_device(
+        &mut self,
+        pci: &mut PciBus,
+        interrupt_manager: &Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
+        device_fd: &Arc<DeviceFd>,
+        device_cfg: &DeviceConfig,
+    ) -> DeviceManagerResult<u32> {
+        // We need to shift the device id since the 3 first bits
+        // are dedicated to the PCI function, and we know we don't
+        // do multifunction. Also, because we only support one PCI
+        // bus, the bus 0, we don't need to add anything to the
+        // global device ID.
+        let device_id = pci.next_device_id() << 3;
+
+        let memory = self.memory_manager.lock().unwrap().guest_memory();
+        let vfio_device = VfioDevice::new(
+            &device_cfg.path,
+            device_fd.clone(),
+            memory.clone(),
+            device_cfg.iommu,
+        )
+        .map_err(DeviceManagerError::VfioCreate)?;
+
+        if device_cfg.iommu {
+            if let Some(iommu) = &self.iommu_device {
+                let vfio_mapping =
+                    Arc::new(VfioDmaMapping::new(vfio_device.get_container(), memory));
+
+                iommu
+                    .lock()
+                    .unwrap()
+                    .add_external_mapping(device_id, vfio_mapping);
+            }
+        }
+
+        let mut vfio_pci_device =
+            VfioPciDevice::new(&self.address_manager.vm_fd, vfio_device, interrupt_manager)
+                .map_err(DeviceManagerError::VfioPciCreate)?;
+
+        let bars = vfio_pci_device
+            .allocate_bars(&mut self.address_manager.allocator.lock().unwrap())
+            .map_err(DeviceManagerError::AllocateBars)?;
+
+        vfio_pci_device
+            .map_mmio_regions(&self.address_manager.vm_fd, || {
+                self.memory_manager
+                    .lock()
+                    .unwrap()
+                    .allocate_kvm_memory_slot()
+            })
+            .map_err(DeviceManagerError::VfioMapRegion)?;
+
+        let vfio_pci_device = Arc::new(Mutex::new(vfio_pci_device));
+
+        pci.add_device(vfio_pci_device.clone())
+            .map_err(DeviceManagerError::AddPciDevice)?;
+
+        self.bus_devices
+            .push(Arc::clone(&vfio_pci_device) as Arc<Mutex<dyn BusDevice>>);
+
+        pci.register_mapping(
+            vfio_pci_device,
+            self.address_manager.io_bus.as_ref(),
+            self.address_manager.mmio_bus.as_ref(),
+            bars,
+        )
+        .map_err(DeviceManagerError::AddPciDevice)?;
+
+        Ok(device_id)
+    }
+
+    #[cfg(feature = "pci_support")]
     fn add_vfio_devices(
         &mut self,
         pci: &mut PciBus,
-        iommu_device: &mut Option<vm_virtio::Iommu>,
         interrupt_manager: &Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
     ) -> DeviceManagerResult<Vec<u32>> {
-        let mut mem_slot = self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .allocate_kvm_memory_slot();
         let mut iommu_attached_device_ids = Vec::new();
+        let devices = self.config.lock().unwrap().devices.clone();
 
-        if let Some(device_list_cfg) = &self.config.lock().unwrap().devices {
+        if let Some(device_list_cfg) = &devices {
             // Create the KVM VFIO device
             let device_fd = DeviceManager::create_kvm_device(&self.address_manager.vm_fd)?;
             let device_fd = Arc::new(device_fd);
+            self.kvm_device_fd = Some(Arc::clone(&device_fd));
 
             for device_cfg in device_list_cfg.iter() {
-                // We need to shift the device id since the 3 first bits
-                // are dedicated to the PCI function, and we know we don't
-                // do multifunction. Also, because we only support one PCI
-                // bus, the bus 0, we don't need to add anything to the
-                // global device ID.
-                let device_id = pci.next_device_id() << 3;
-
-                let memory = self.memory_manager.lock().unwrap().guest_memory();
-                let vfio_device = VfioDevice::new(
-                    &device_cfg.path,
-                    device_fd.clone(),
-                    memory.clone(),
-                    device_cfg.iommu,
-                )
-                .map_err(DeviceManagerError::VfioCreate)?;
-
-                if device_cfg.iommu {
-                    if let Some(iommu) = iommu_device {
-                        let vfio_mapping = Arc::new(VfioDmaMapping::new(
-                            vfio_device.get_container(),
-                            memory.clone(),
-                        ));
-
-                        iommu_attached_device_ids.push(device_id);
-                        iommu.add_external_mapping(device_id, vfio_mapping);
-                    }
+                let device_id =
+                    self.add_vfio_device(pci, interrupt_manager, &device_fd, device_cfg)?;
+                if self.iommu_device.is_some() {
+                    iommu_attached_device_ids.push(device_id);
                 }
-
-                let mut vfio_pci_device =
-                    VfioPciDevice::new(&self.address_manager.vm_fd, vfio_device, interrupt_manager)
-                        .map_err(DeviceManagerError::VfioPciCreate)?;
-
-                let bars = vfio_pci_device
-                    .allocate_bars(&mut self.address_manager.allocator.lock().unwrap())
-                    .map_err(DeviceManagerError::AllocateBars)?;
-
-                mem_slot = vfio_pci_device
-                    .map_mmio_regions(&self.address_manager.vm_fd, mem_slot)
-                    .map_err(DeviceManagerError::VfioMapRegion)?;
-
-                let vfio_pci_device = Arc::new(Mutex::new(vfio_pci_device));
-
-                pci.add_device(vfio_pci_device.clone())
-                    .map_err(DeviceManagerError::AddPciDevice)?;
-
-                pci.register_mapping(
-                    vfio_pci_device.clone(),
-                    self.address_manager.io_bus.as_ref(),
-                    self.address_manager.mmio_bus.as_ref(),
-                    bars,
-                )
-                .map_err(DeviceManagerError::AddPciDevice)?;
             }
         }
         Ok(iommu_attached_device_ids)
@@ -1451,6 +1560,9 @@ impl DeviceManager {
         pci.add_device(virtio_pci_device.clone())
             .map_err(DeviceManagerError::AddPciDevice)?;
 
+        self.bus_devices
+            .push(Arc::clone(&virtio_pci_device) as Arc<Mutex<dyn BusDevice>>);
+
         pci.register_mapping(
             virtio_pci_device.clone(),
             self.address_manager.io_bus.as_ref(),
@@ -1507,6 +1619,8 @@ impl DeviceManager {
         mmio_device.assign_interrupt(interrupt_group);
 
         let mmio_device_arc = Arc::new(Mutex::new(mmio_device));
+        self.bus_devices
+            .push(Arc::clone(&mmio_device_arc) as Arc<Mutex<dyn BusDevice>>);
         self.address_manager
             .mmio_bus
             .insert(mmio_device_arc.clone(), mmio_base.0, MMIO_LEN)
@@ -1565,48 +1679,245 @@ impl DeviceManager {
         #[cfg(not(feature = "acpi"))]
         return Ok(());
     }
+
+    #[cfg(feature = "pci_support")]
+    pub fn add_device(&mut self, path: String) -> DeviceManagerResult<DeviceConfig> {
+        let device_cfg = DeviceConfig {
+            path: PathBuf::from(path),
+            iommu: false,
+        };
+
+        let pci = if let Some(pci_bus) = &self.pci_bus {
+            Arc::clone(&pci_bus)
+        } else {
+            return Err(DeviceManagerError::NoPciBus);
+        };
+
+        let interrupt_manager = Arc::clone(&self.msi_interrupt_manager);
+
+        let device_fd = if let Some(device_fd) = &self.kvm_device_fd {
+            Arc::clone(&device_fd)
+        } else {
+            // If the VFIO KVM device file descriptor has not been created yet,
+            // it is created here and stored in the DeviceManager structure for
+            // future needs.
+            let device_fd = DeviceManager::create_kvm_device(&self.address_manager.vm_fd)?;
+            let device_fd = Arc::new(device_fd);
+            self.kvm_device_fd = Some(Arc::clone(&device_fd));
+            device_fd
+        };
+
+        let device_id = self.add_vfio_device(
+            &mut pci.lock().unwrap(),
+            &interrupt_manager,
+            &device_fd,
+            &device_cfg,
+        )?;
+
+        // Update the PCIU bitmap
+        self.pci_devices_up |= 1 << (device_id >> 3);
+
+        Ok(device_cfg)
+    }
+}
+
+#[cfg(feature = "acpi")]
+struct PciDevSlot {
+    device_id: u8,
+}
+
+#[cfg(feature = "acpi")]
+impl Aml for PciDevSlot {
+    fn to_aml_bytes(&self) -> Vec<u8> {
+        let sun = self.device_id;
+        let adr: u32 = (self.device_id as u32) << 16;
+        aml::Device::new(
+            format!("S{:03}", self.device_id).as_str().into(),
+            vec![
+                &aml::Name::new("_SUN".into(), &sun),
+                &aml::Name::new("_ADR".into(), &adr),
+                &aml::Method::new(
+                    "_EJ0".into(),
+                    1,
+                    true,
+                    vec![&aml::MethodCall::new(
+                        "\\_SB_.PHPR.PCEJ".into(),
+                        vec![&aml::Path::new("_SUN")],
+                    )],
+                ),
+            ],
+        )
+        .to_aml_bytes()
+    }
+}
+
+#[cfg(feature = "acpi")]
+struct PciDevSlotNotify {
+    device_id: u8,
+}
+
+#[cfg(feature = "acpi")]
+impl Aml for PciDevSlotNotify {
+    fn to_aml_bytes(&self) -> Vec<u8> {
+        let device_id_mask: u32 = 1 << self.device_id;
+        let object = aml::Path::new(&format!("S{:03}", self.device_id));
+        let mut bytes = aml::And::new(&aml::Local(0), &aml::Arg(0), &device_id_mask).to_aml_bytes();
+        bytes.extend_from_slice(
+            &aml::If::new(
+                &aml::Equal::new(&aml::Local(0), &device_id_mask),
+                vec![&aml::Notify::new(&object, &aml::Arg(1))],
+            )
+            .to_aml_bytes(),
+        );
+        bytes
+    }
+}
+
+#[cfg(feature = "acpi")]
+struct PciDevSlotMethods {}
+
+#[cfg(feature = "acpi")]
+impl Aml for PciDevSlotMethods {
+    fn to_aml_bytes(&self) -> Vec<u8> {
+        let mut device_notifies = Vec::new();
+        for device_id in 0..32 {
+            device_notifies.push(PciDevSlotNotify { device_id });
+        }
+
+        let mut device_notifies_refs: Vec<&dyn aml::Aml> = Vec::new();
+        for device_notify in device_notifies.iter() {
+            device_notifies_refs.push(device_notify);
+        }
+
+        let mut bytes =
+            aml::Method::new("DVNT".into(), 2, true, device_notifies_refs).to_aml_bytes();
+
+        bytes.extend_from_slice(
+            &aml::Method::new(
+                "PCNT".into(),
+                0,
+                true,
+                vec![
+                    &aml::MethodCall::new(
+                        "DVNT".into(),
+                        vec![&aml::Path::new("\\_SB_.PHPR.PCIU"), &aml::ONE],
+                    ),
+                    &aml::MethodCall::new(
+                        "DVNT".into(),
+                        vec![&aml::Path::new("\\_SB_.PHPR.PCID"), &3usize],
+                    ),
+                ],
+            )
+            .to_aml_bytes(),
+        );
+        bytes
+    }
 }
 
 #[cfg(feature = "acpi")]
 impl Aml for DeviceManager {
     fn to_aml_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+        // PCI hotplug controller
+        bytes.extend_from_slice(
+            &aml::Device::new(
+                "_SB_.PHPR".into(),
+                vec![
+                    &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A06")),
+                    &aml::Name::new("_STA".into(), &0x0bu8),
+                    &aml::Mutex::new("BLCK".into(), 0),
+                    // I/O port for PCI hotplug controller
+                    &aml::Name::new(
+                        "_CRS".into(),
+                        &aml::ResourceTemplate::new(vec![&aml::IO::new(
+                            0xae00, 0xae00, 0x01, 0x10,
+                        )]),
+                    ),
+                    // OpRegion and Fields map I/O port into individual field values
+                    &aml::OpRegion::new("PCST".into(), aml::OpRegionSpace::SystemIO, 0xae00, 0x10),
+                    &aml::Field::new(
+                        "PCST".into(),
+                        aml::FieldAccessType::DWord,
+                        aml::FieldUpdateRule::WriteAsZeroes,
+                        vec![
+                            aml::FieldEntry::Named(*b"PCIU", 32),
+                            aml::FieldEntry::Named(*b"PCID", 32),
+                            aml::FieldEntry::Named(*b"B0EJ", 32),
+                        ],
+                    ),
+                    &aml::Method::new(
+                        "PCEJ".into(),
+                        1,
+                        true,
+                        vec![
+                            // Take lock defined above
+                            &aml::Acquire::new("BLCK".into(), 0xffff),
+                            // Write PCI bus number (in first argument) to I/O port via field
+                            &aml::ShiftLeft::new(&aml::Path::new("B0EJ"), &aml::ONE, &aml::Arg(0)),
+                            // Release lock
+                            &aml::Release::new("BLCK".into()),
+                            // Return 0
+                            &aml::Return::new(&aml::ZERO),
+                        ],
+                    ),
+                ],
+            )
+            .to_aml_bytes(),
+        );
+
         let start_of_device_area = self.memory_manager.lock().unwrap().start_of_device_area().0;
         let end_of_device_area = self.memory_manager.lock().unwrap().end_of_device_area().0;
-        let pci_dsdt_data = aml::Device::new(
-            "_SB_.PCI0".into(),
-            vec![
-                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A08")),
-                &aml::Name::new("_CID".into(), &aml::EISAName::new("PNP0A03")),
-                &aml::Name::new("_ADR".into(), &aml::ZERO),
-                &aml::Name::new("_SEG".into(), &aml::ZERO),
-                &aml::Name::new("_UID".into(), &aml::ZERO),
-                &aml::Name::new("SUPP".into(), &aml::ZERO),
-                &aml::Name::new(
-                    "_CRS".into(),
-                    &aml::ResourceTemplate::new(vec![
-                        &aml::AddressSpace::new_bus_number(0x0u16, 0xffu16),
-                        &aml::IO::new(0xcf8, 0xcf8, 1, 0x8),
-                        &aml::AddressSpace::new_io(0x0u16, 0xcf7u16),
-                        &aml::AddressSpace::new_io(0xd00u16, 0xffffu16),
-                        &aml::AddressSpace::new_memory(
-                            aml::AddressSpaceCachable::NotCacheable,
-                            true,
-                            layout::MEM_32BIT_DEVICES_START.0 as u32,
-                            (layout::MEM_32BIT_DEVICES_START.0 + layout::MEM_32BIT_DEVICES_SIZE - 1)
-                                as u32,
-                        ),
-                        &aml::AddressSpace::new_memory(
-                            aml::AddressSpaceCachable::NotCacheable,
-                            true,
-                            start_of_device_area,
-                            end_of_device_area,
-                        ),
-                    ]),
+
+        let mut pci_dsdt_inner_data: Vec<&dyn aml::Aml> = Vec::new();
+        let hid = aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A08"));
+        pci_dsdt_inner_data.push(&hid);
+        let cid = aml::Name::new("_CID".into(), &aml::EISAName::new("PNP0A03"));
+        pci_dsdt_inner_data.push(&cid);
+        let adr = aml::Name::new("_ADR".into(), &aml::ZERO);
+        pci_dsdt_inner_data.push(&adr);
+        let seg = aml::Name::new("_SEG".into(), &aml::ZERO);
+        pci_dsdt_inner_data.push(&seg);
+        let uid = aml::Name::new("_UID".into(), &aml::ZERO);
+        pci_dsdt_inner_data.push(&uid);
+        let supp = aml::Name::new("SUPP".into(), &aml::ZERO);
+        pci_dsdt_inner_data.push(&supp);
+        let crs = aml::Name::new(
+            "_CRS".into(),
+            &aml::ResourceTemplate::new(vec![
+                &aml::AddressSpace::new_bus_number(0x0u16, 0xffu16),
+                &aml::IO::new(0xcf8, 0xcf8, 1, 0x8),
+                &aml::AddressSpace::new_io(0x0u16, 0xcf7u16),
+                &aml::AddressSpace::new_io(0xd00u16, 0xffffu16),
+                &aml::AddressSpace::new_memory(
+                    aml::AddressSpaceCachable::NotCacheable,
+                    true,
+                    layout::MEM_32BIT_DEVICES_START.0 as u32,
+                    (layout::MEM_32BIT_DEVICES_START.0 + layout::MEM_32BIT_DEVICES_SIZE - 1) as u32,
                 ),
-            ],
-        )
-        .to_aml_bytes();
+                &aml::AddressSpace::new_memory(
+                    aml::AddressSpaceCachable::NotCacheable,
+                    true,
+                    start_of_device_area,
+                    end_of_device_area,
+                ),
+            ]),
+        );
+        pci_dsdt_inner_data.push(&crs);
+
+        let mut pci_devices = Vec::new();
+        for device_id in 0..32 {
+            let pci_device = PciDevSlot { device_id };
+            pci_devices.push(pci_device);
+        }
+        for pci_device in pci_devices.iter() {
+            pci_dsdt_inner_data.push(pci_device);
+        }
+
+        let pci_device_methods = PciDevSlotMethods {};
+        pci_dsdt_inner_data.push(&pci_device_methods);
+
+        let pci_dsdt_data =
+            aml::Device::new("_SB_.PCI0".into(), pci_dsdt_inner_data).to_aml_bytes();
 
         let mbrd_dsdt_data = aml::Device::new(
             "_SB_.MBRD".into(),
@@ -1683,6 +1994,49 @@ impl Pausable for DeviceManager {
 
 impl Snapshotable for DeviceManager {}
 impl Migratable for DeviceManager {}
+
+#[cfg(feature = "pci_support")]
+const PCIU_FIELD_OFFSET: u64 = 0;
+#[cfg(feature = "pci_support")]
+const PCID_FIELD_OFFSET: u64 = 4;
+
+#[cfg(feature = "pci_support")]
+const PCIU_FIELD_SIZE: usize = 4;
+#[cfg(feature = "pci_support")]
+const PCID_FIELD_SIZE: usize = 4;
+
+impl BusDevice for DeviceManager {
+    fn read(&mut self, base: u64, offset: u64, data: &mut [u8]) {
+        #[cfg(feature = "pci_support")]
+        match offset {
+            PCIU_FIELD_OFFSET => {
+                assert!(data.len() == PCIU_FIELD_SIZE);
+                data.copy_from_slice(&self.pci_devices_up.to_le_bytes());
+                // Clear the PCIU bitmap
+                self.pci_devices_up = 0;
+            }
+            PCID_FIELD_OFFSET => {
+                assert!(data.len() == PCID_FIELD_SIZE);
+                data.copy_from_slice(&self.pci_devices_down.to_le_bytes());
+                // Clear the PCID bitmap
+                self.pci_devices_down = 0;
+            }
+            _ => {}
+        }
+
+        debug!(
+            "PCI_HP_REG_R: base 0x{:x}, offset 0x{:x}, data {:?}",
+            base, offset, data
+        )
+    }
+
+    fn write(&mut self, base: u64, offset: u64, data: &[u8]) {
+        debug!(
+            "PCI_HP_REG_W: base 0x{:x}, offset 0x{:x}, data {:?}",
+            base, offset, data
+        )
+    }
+}
 
 impl Drop for DeviceManager {
     fn drop(&mut self) {

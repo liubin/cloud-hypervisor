@@ -39,10 +39,12 @@ mod tests {
         guest_ip: String,
         l2_guest_ip1: String,
         l2_guest_ip2: String,
+        l2_guest_ip3: String,
         host_ip: String,
         guest_mac: String,
         l2_guest_mac1: String,
         l2_guest_mac2: String,
+        l2_guest_mac3: String,
     }
 
     struct Guest<'a> {
@@ -160,11 +162,14 @@ mod tests {
             user_data_string = user_data_string.replace("192.168.2.2", &network.guest_ip);
             user_data_string = user_data_string.replace("192.168.2.3", &network.l2_guest_ip1);
             user_data_string = user_data_string.replace("192.168.2.4", &network.l2_guest_ip2);
+            user_data_string = user_data_string.replace("192.168.2.5", &network.l2_guest_ip3);
             user_data_string = user_data_string.replace("12:34:56:78:90:ab", &network.guest_mac);
             user_data_string =
                 user_data_string.replace("de:ad:be:ef:12:34", &network.l2_guest_mac1);
             user_data_string =
                 user_data_string.replace("de:ad:be:ef:34:56", &network.l2_guest_mac2);
+            user_data_string =
+                user_data_string.replace("de:ad:be:ef:56:78", &network.l2_guest_mac3);
 
             fs::File::create(cloud_init_directory.join("latest").join("user_data"))
                 .unwrap()
@@ -193,10 +198,10 @@ mod tests {
             workload_path.push("workloads");
 
             let mut osdisk_base_path = workload_path.clone();
-            osdisk_base_path.push("clear-31310-cloudguest.img");
+            osdisk_base_path.push("clear-31311-cloudguest.img");
 
             let mut osdisk_raw_base_path = workload_path;
-            osdisk_raw_base_path.push("clear-31310-cloudguest-raw.img");
+            osdisk_raw_base_path.push("clear-31311-cloudguest-raw.img");
 
             let osdisk_path = String::from(tmp_dir.path().join("osdisk.img").to_str().unwrap());
             let osdisk_raw_path =
@@ -405,6 +410,37 @@ mod tests {
         )
     }
 
+    fn prepare_vhost_user_net_daemon(
+        tmp_dir: &TempDir,
+        ip: &str,
+        tap: Option<&str>,
+        num_queues: usize,
+    ) -> (std::process::Child, String) {
+        let vunet_socket_path = String::from(tmp_dir.path().join("vunet.sock").to_str().unwrap());
+
+        // Start the daemon
+        let net_params = if let Some(tap_str) = tap {
+            format!(
+                "tap={},ip={},mask=255.255.255.0,sock={},num_queues={},queue_size=1024",
+                tap_str, ip, vunet_socket_path, num_queues
+            )
+        } else {
+            format!(
+                "ip={},mask=255.255.255.0,sock={},num_queues={},queue_size=1024",
+                ip, vunet_socket_path, num_queues
+            )
+        };
+
+        let child = Command::new("target/release/cloud-hypervisor")
+            .args(&["--net-backend", net_params.as_str()])
+            .spawn()
+            .unwrap();
+
+        thread::sleep(std::time::Duration::new(10, 0));
+
+        (child, vunet_socket_path)
+    }
+
     fn curl_command(api_socket: &str, method: &str, url: &str, http_body: Option<&str>) {
         let mut curl_args: Vec<&str> =
             ["--unix-socket", api_socket, "-i", "-X", method, url].to_vec();
@@ -498,10 +534,12 @@ mod tests {
                 guest_ip: format!("{}.{}.2", class, id),
                 l2_guest_ip1: format!("{}.{}.3", class, id),
                 l2_guest_ip2: format!("{}.{}.4", class, id),
+                l2_guest_ip3: format!("{}.{}.5", class, id),
                 host_ip: format!("{}.{}.1", class, id),
                 guest_mac: format!("12:34:56:78:90:{:02x}", id),
                 l2_guest_mac1: format!("de:ad:be:ef:12:{:02x}", id),
                 l2_guest_mac2: format!("de:ad:be:ef:34:{:02x}", id),
+                l2_guest_mac3: format!("de:ad:be:ef:56:{:02x}", id),
             };
 
             disk_config.prepare_files(&tmp_dir, &network);
@@ -567,6 +605,15 @@ mod tests {
             ssh_command_ip(
                 command,
                 &self.network.l2_guest_ip2,
+                DEFAULT_SSH_RETRIES,
+                DEFAULT_SSH_TIMEOUT,
+            )
+        }
+
+        fn ssh_command_l2_3(&self, command: &str) -> Result<String, Error> {
+            ssh_command_ip(
+                command,
+                &self.network.l2_guest_ip3,
                 DEFAULT_SSH_RETRIES,
                 DEFAULT_SSH_TIMEOUT,
             )
@@ -675,7 +722,7 @@ mod tests {
             cache_size: Option<u64>,
         ) -> Result<bool, Error> {
             let shm_region = self
-                .ssh_command("sudo -E bash -c 'cat /proc/iomem' | grep virtio-pci-shm")?
+                .ssh_command("sudo grep virtio-pci-shm /proc/iomem")?
                 .trim()
                 .to_string();
 
@@ -955,7 +1002,7 @@ mod tests {
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .spawn()
                 .unwrap();
 
@@ -1000,7 +1047,7 @@ mod tests {
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .spawn()
                 .unwrap();
 
@@ -1107,43 +1154,45 @@ mod tests {
         });
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
-    fn test_vhost_user_net() {
+    fn test_vhost_user_net(
+        tap: Option<&str>,
+        num_queues: usize,
+        prepare_vhost_user_net_daemon: &dyn Fn(
+            &TempDir,
+            &str,
+            Option<&str>,
+            usize,
+        ) -> (std::process::Child, String),
+    ) {
         test_block!(tb, "", {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
 
             // Start the daemon
-            let mut daemon_child = Command::new("target/release/cloud-hypervisor")
-                .args(&[
-                    "--net-backend",
-                    format!(
-                        "ip={},mask=255.255.255.0,sock=/tmp/vunet.sock,num_queues=4,queue_size=1024",
-                        guest.network.host_ip
-                    )
-                    .as_str(),
-                ])
-                .spawn()
-                .unwrap();
-            thread::sleep(std::time::Duration::new(10, 0));
+            let (mut daemon_child, vunet_socket_path) = prepare_vhost_user_net_daemon(
+                &guest.tmp_dir,
+                &guest.network.host_ip,
+                tap,
+                num_queues,
+            );
 
             let mut cloud_child = GuestCommand::new(&guest)
-                .args(&["--cpus", "boot=4"])
+                .args(&["--cpus", format!("boot={}", num_queues / 2).as_str()])
                 .args(&["--memory", "size=512M,file=/dev/shm"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .default_disks()
                 .args(&[
                     "--net",
                     format!(
-                        "vhost_user=true,mac={},socket=/tmp/vunet.sock,num_queues=4,queue_size=1024",
-                        guest.network.guest_mac
+                        "vhost_user=true,mac={},socket={},num_queues={},queue_size=1024",
+                        guest.network.guest_mac, vunet_socket_path, num_queues,
                     )
                     .as_str(),
                 ])
                 .spawn()
                 .unwrap();
 
-            thread::sleep(std::time::Duration::new(10, 0));
+            thread::sleep(std::time::Duration::new(20, 0));
             // 1 network interface + default localhost ==> 2 interfaces
             // It's important to note that this test is fully exercising the
             // vhost-user-net implementation and the associated backend since
@@ -1160,8 +1209,6 @@ mod tests {
                     .unwrap_or_default(),
                 2
             );
-
-            thread::sleep(std::time::Duration::new(10, 0));
 
             // The following pci devices will appear on guest with PCI-MSI
             // interrupt vectors assigned.
@@ -1180,7 +1227,7 @@ mod tests {
                     .trim()
                     .parse::<u32>()
                     .unwrap_or_default(),
-                14
+                10 + (num_queues as u32)
             );
 
             let _ = cloud_child.kill();
@@ -1192,6 +1239,26 @@ mod tests {
 
             Ok(())
         });
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_vhost_user_net_default() {
+        test_vhost_user_net(None, 2, &prepare_vhost_user_net_daemon)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_vhost_user_net_tap() {
+        test_vhost_user_net(Some("vunet-tap0"), 2, &prepare_vhost_user_net_daemon)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_vhost_user_net_multiple_queues() {
+        test_vhost_user_net(None, 4, &prepare_vhost_user_net_daemon)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_vhost_user_net_tap_multiple_queues() {
+        test_vhost_user_net(Some("vunet-tap1"), 4, &prepare_vhost_user_net_daemon)
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -1581,8 +1648,7 @@ mod tests {
 
             // Just check the VM booted correctly.
             aver_eq!(tb, guest.get_cpu_count().unwrap_or_default(), 1);
-            aver!(tb, guest.get_total_memory().unwrap_or_default() > 492_000);
-            aver!(tb, guest.get_entropy().unwrap_or_default() >= 900);
+            aver!(tb, guest.get_total_memory().unwrap_or_default() > 491_000);
 
             let _ = cloud_child.kill();
             let _ = cloud_child.wait();
@@ -1687,7 +1753,7 @@ mod tests {
                 ])
                 .args(&[
                     "--cmdline",
-                    "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 \
+                    "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c \
                      console=tty0 console=ttyS0,115200n8 console=hvc0 quiet \
                      init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable \
                      no_timer_check noreplace-smp cryptomgr.notests \
@@ -1710,7 +1776,10 @@ mod tests {
                 guest.ssh_command(&mount_cmd).unwrap_or_default().trim(),
                 "ok"
             );
-            // Check the cache size is the expected one
+
+            // Check the cache size is the expected one.
+            // With virtio-mmio the cache doesn't appear in /proc/iomem
+            #[cfg(not(feature = "mmio"))]
             aver_eq!(
                 tb,
                 guest
@@ -1754,27 +1823,27 @@ mod tests {
         });
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
+    #[test]
     fn test_virtio_fs_dax_on_default_cache_size() {
         test_virtio_fs(true, None, "none", &prepare_virtiofsd)
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
+    #[test]
     fn test_virtio_fs_dax_on_cache_size_1_gib() {
         test_virtio_fs(true, Some(0x4000_0000), "none", &prepare_virtiofsd)
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
+    #[test]
     fn test_virtio_fs_dax_off() {
         test_virtio_fs(false, None, "none", &prepare_virtiofsd)
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
+    #[test]
     fn test_virtio_fs_dax_on_default_cache_size_w_vhost_user_fs_daemon() {
         test_virtio_fs(true, None, "none", &prepare_vhost_user_fs_daemon)
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
+    #[test]
     fn test_virtio_fs_dax_on_cache_size_1_gib_w_vhost_user_fs_daemon() {
         test_virtio_fs(
             true,
@@ -1784,7 +1853,7 @@ mod tests {
         )
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
+    #[test]
     fn test_virtio_fs_dax_off_w_vhost_user_fs_daemon() {
         test_virtio_fs(false, None, "none", &prepare_vhost_user_fs_daemon)
     }
@@ -1816,7 +1885,7 @@ mod tests {
                     )
                     .as_str(),
                 ])
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .spawn()
                 .unwrap();
 
@@ -1870,7 +1939,7 @@ mod tests {
                     )
                     .as_str(),
                 ])
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .spawn()
                 .unwrap();
 
@@ -2130,7 +2199,7 @@ mod tests {
             );
 
             let text = String::from("On a branch floating down river a cricket, singing.");
-            let cmd = format!("sudo -E bash -c 'echo {} > /dev/hvc0'", text);
+            let cmd = format!("echo {} | sudo tee /dev/hvc0", text);
             guest.ssh_command(&cmd)?;
 
             let _ = child.kill();
@@ -2186,17 +2255,14 @@ mod tests {
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
-    // The VFIO integration test starts a cloud-hypervisor guest and then
-    // direct assigns one of the virtio-pci device to a cloud-hypervisor
-    // nested guest. The test assigns one of the 2 virtio-pci networking
-    // interface, and thus the cloud-hypervisor guest will get a networking
-    // interface through that direct assignment.
-    // The test starts cloud-hypervisor guest with 2 TAP backed networking
-    // interfaces, bound through a simple bridge on the host. So if the nested
-    // cloud-hypervisor succeeds in getting a directly assigned interface from
-    // its cloud-hypervisor host, we should be able to ssh into it, and verify
-    // that it's running with the right kernel command line (We tag the command
-    // line from cloud-hypervisor for that purpose).
+    // The VFIO integration test starts cloud-hypervisor guest with 3 TAP
+    // backed networking interfaces, bound through a simple bridge on the host.
+    // So if the nested cloud-hypervisor succeeds in getting a directly
+    // assigned interface from its cloud-hypervisor host, we should be able to
+    // ssh into it, and verify that it's running with the right kernel command
+    // line (We tag the command line from cloud-hypervisor for that purpose).
+    // The third device is added to validate that hotplug works correctly since
+    // it is being added to the L2 VM through hotplugging mechanism.
     fn test_vfio() {
         test_block!(tb, "", {
             let mut clear = ClearDiskConfig::new();
@@ -2225,6 +2291,7 @@ mod tests {
             let vfio_tap0 = "vfio-tap0";
             let vfio_tap1 = "vfio-tap1";
             let vfio_tap2 = "vfio-tap2";
+            let vfio_tap3 = "vfio-tap3";
 
             let (mut daemon_child, virtiofsd_socket_path) =
                 prepare_virtiofsd(&guest.tmp_dir, vfio_path.to_str().unwrap(), "none");
@@ -2234,7 +2301,7 @@ mod tests {
                 .args(&["--memory", "size=1G,file=/dev/hugepages"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 vfio_iommu_type1.allow_unsafe_interrupts rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 vfio_iommu_type1.allow_unsafe_interrupts rw"])
                 .args(&[
                     "--net",
                     format!(
@@ -2247,6 +2314,10 @@ mod tests {
                     .as_str(),
                     format!(
                         "tap={},mac={},iommu=on", vfio_tap2, guest.network.l2_guest_mac2
+                    )
+                    .as_str(),
+                    format!(
+                        "tap={},mac={},iommu=on", vfio_tap3, guest.network.l2_guest_mac3
                     )
                     .as_str(),
                 ])
@@ -2295,6 +2366,36 @@ mod tests {
                 1
             );
 
+            // Hotplug an extra virtio-net device through L2 VM.
+            guest.ssh_command_l1(
+                "echo 0000:00:07.0 | sudo tee /sys/bus/pci/devices/0000:00:07.0/driver/unbind",
+            )?;
+            guest
+                .ssh_command_l1("echo 1af4 1041 | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id")?;
+            guest.ssh_command_l1(
+                "sudo curl \
+                 --unix-socket /tmp/ch_api.sock \
+                 -i \
+                 -X PUT http://localhost/api/v1/vm.add-device \
+                 -H 'Accept: application/json' -H 'Content-Type: application/json' \
+                 -d '{\"path\":\"/sys/bus/pci/devices/0000:00:07.0\"}'",
+            )?;
+            thread::sleep(std::time::Duration::new(10, 0));
+
+            // Let's also verify from the third virtio-net device passed to
+            // the L2 VM. This third device has been hotplugged through the L2
+            // VM, so this is our way to validate hotplug works for VFIO PCI.
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command_l2_3("grep -c VFIOTAG /proc/cmdline")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
             let _ = child.kill();
             let _ = daemon_child.kill();
             let _ = child.wait();
@@ -2321,7 +2422,7 @@ mod tests {
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw acpi=off"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw acpi=off"])
                 .spawn()
                 .unwrap();
 
@@ -2425,7 +2526,7 @@ mod tests {
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .spawn()
                 .unwrap();
 
@@ -2556,7 +2657,7 @@ mod tests {
 
             // Then boot it
             curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
-            thread::sleep(std::time::Duration::new(5, 0));
+            thread::sleep(std::time::Duration::new(20, 0));
 
             // Check that the VM booted as expected
             aver_eq!(
@@ -2610,7 +2711,7 @@ mod tests {
 
             // Then boot it
             curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
-            thread::sleep(std::time::Duration::new(5, 0));
+            thread::sleep(std::time::Duration::new(20, 0));
 
             // Check that the VM booted as expected
             aver_eq!(
@@ -2695,7 +2796,7 @@ mod tests {
                     .as_str(),
                 ])
                 .args(&["--net", guest.default_net_string_w_iommu().as_str()])
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .spawn()
                 .unwrap();
 
@@ -2788,12 +2889,12 @@ mod tests {
                 3
             );
 
-            let init_bar_addr = guest
-                .ssh_command("sudo bash -c \"cat /sys/bus/pci/devices/0000:00:05.0/resource | awk '{print $1; exit}'\"")?;
+            let init_bar_addr = guest.ssh_command(
+                "sudo awk '{print $1; exit}' /sys/bus/pci/devices/0000:00:05.0/resource",
+            )?;
 
             // Remove the PCI device
-            guest
-                .ssh_command("sudo bash -c 'echo 1 > /sys/bus/pci/devices/0000:00:05.0/remove'")?;
+            guest.ssh_command("echo 1 | sudo tee /sys/bus/pci/devices/0000:00:05.0/remove")?;
 
             // Only 1 network interface left + default localhost ==> 2 interfaces
             aver_eq!(
@@ -2808,7 +2909,7 @@ mod tests {
             );
 
             // Remove the PCI device
-            guest.ssh_command("sudo bash -c 'echo 1 > /sys/bus/pci/rescan'")?;
+            guest.ssh_command("echo 1 | sudo tee /sys/bus/pci/rescan")?;
 
             // Back to 2 network interface + default localhost ==> 3 interfaces
             aver_eq!(
@@ -2822,8 +2923,9 @@ mod tests {
                 3
             );
 
-            let new_bar_addr = guest
-                .ssh_command("sudo bash -c \"cat /sys/bus/pci/devices/0000:00:05.0/resource | awk '{print $1; exit}'\"")?;
+            let new_bar_addr = guest.ssh_command(
+                "sudo awk '{print $1; exit}' /sys/bus/pci/devices/0000:00:05.0/resource",
+            )?;
 
             // Let's compare the BAR addresses for our virtio-net device.
             // They should be different as we expect the BAR reprogramming
@@ -2946,7 +3048,7 @@ mod tests {
                 .args(&["--cpus", "boot=2,max=4"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .default_disks()
                 .default_net()
                 .args(&["--api-socket", &api_socket])
@@ -3038,7 +3140,7 @@ mod tests {
                 .args(&["--cpus", "boot=2,max=4"])
                 .args(&["--memory", "size=512M,hotplug_size=8192M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .default_disks()
                 .default_net()
                 .args(&["--api-socket", &api_socket])
@@ -3150,7 +3252,7 @@ mod tests {
                 .args(&["--cpus", "boot=2,max=4"])
                 .args(&["--memory", "size=512M,hotplug_size=8192M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .default_disks()
                 .default_net()
                 .args(&["--api-socket", &api_socket])
@@ -3247,7 +3349,7 @@ mod tests {
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .spawn()
                 .unwrap();
 

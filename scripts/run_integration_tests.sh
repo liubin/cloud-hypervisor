@@ -6,28 +6,30 @@ source $HOME/.cargo/env
 WORKLOADS_DIR="$HOME/workloads"
 mkdir -p "$WORKLOADS_DIR"
 
+cp scripts/sha1sums $WORKLOADS_DIR
+
 FW_URL=$(curl --silent https://api.github.com/repos/cloud-hypervisor/rust-hypervisor-firmware/releases/latest | grep "browser_download_url" | grep -o 'https://.*[^ "]')
 FW="$WORKLOADS_DIR/hypervisor-fw"
 if [ ! -f "$FW" ]; then
     pushd $WORKLOADS_DIR
-    time wget --quiet $FW_URL
+    time wget --quiet $FW_URL || exit 1
     popd
 fi
 
-CLEAR_OS_IMAGE_NAME="clear-31310-cloudguest.img"
+CLEAR_OS_IMAGE_NAME="clear-31311-cloudguest.img"
 CLEAR_OS_IMAGE_URL="https://cloudhypervisorstorage.blob.core.windows.net/images/$CLEAR_OS_IMAGE_NAME"
 CLEAR_OS_IMAGE="$WORKLOADS_DIR/$CLEAR_OS_IMAGE_NAME"
 if [ ! -f "$CLEAR_OS_IMAGE" ]; then
     pushd $WORKLOADS_DIR
-    time wget --quiet $CLEAR_OS_IMAGE_URL
+    time wget --quiet $CLEAR_OS_IMAGE_URL || exit 1
     popd
 fi
 
-CLEAR_OS_RAW_IMAGE_NAME="clear-31310-cloudguest-raw.img"
+CLEAR_OS_RAW_IMAGE_NAME="clear-31311-cloudguest-raw.img"
 CLEAR_OS_RAW_IMAGE="$WORKLOADS_DIR/$CLEAR_OS_RAW_IMAGE_NAME"
 if [ ! -f "$CLEAR_OS_RAW_IMAGE" ]; then
     pushd $WORKLOADS_DIR
-    time qemu-img convert -p -f qcow2 -O raw $CLEAR_OS_IMAGE_NAME $CLEAR_OS_RAW_IMAGE_NAME
+    time qemu-img convert -p -f qcow2 -O raw $CLEAR_OS_IMAGE_NAME $CLEAR_OS_RAW_IMAGE_NAME || exit 1
     popd
 fi
 
@@ -36,7 +38,7 @@ BIONIC_OS_IMAGE_URL="https://cloudhypervisorstorage.blob.core.windows.net/images
 BIONIC_OS_IMAGE="$WORKLOADS_DIR/$BIONIC_OS_IMAGE_NAME"
 if [ ! -f "$BIONIC_OS_IMAGE" ]; then
     pushd $WORKLOADS_DIR
-    time wget --quiet $BIONIC_OS_IMAGE_URL
+    time wget --quiet $BIONIC_OS_IMAGE_URL || exit 1
     popd
 fi
 
@@ -44,7 +46,7 @@ BIONIC_OS_RAW_IMAGE_NAME="bionic-server-cloudimg-amd64-raw.img"
 BIONIC_OS_RAW_IMAGE="$WORKLOADS_DIR/$BIONIC_OS_RAW_IMAGE_NAME"
 if [ ! -f "$BIONIC_OS_RAW_IMAGE" ]; then
     pushd $WORKLOADS_DIR
-    time qemu-img convert -p -f qcow2 -O raw $BIONIC_OS_IMAGE_NAME $BIONIC_OS_RAW_IMAGE_NAME
+    time qemu-img convert -p -f qcow2 -O raw $BIONIC_OS_IMAGE_NAME $BIONIC_OS_RAW_IMAGE_NAME || exit 1
     popd
 fi
 
@@ -54,7 +56,7 @@ EOAN_OS_IMAGE_URL="https://cloudhypervisorstorage.blob.core.windows.net/images/$
 EOAN_OS_IMAGE="$WORKLOADS_DIR/$EOAN_OS_IMAGE_NAME"
 if [ ! -f "$EOAN_OS_IMAGE" ]; then
     pushd $WORKLOADS_DIR
-    time wget --quiet $EOAN_OS_IMAGE_URL
+    time wget --quiet $EOAN_OS_IMAGE_URL || exit 1
     popd
 fi
 
@@ -62,12 +64,12 @@ EOAN_OS_RAW_IMAGE_NAME="eoan-server-cloudimg-amd64-raw.img"
 EOAN_OS_RAW_IMAGE="$WORKLOADS_DIR/$EOAN_OS_RAW_IMAGE_NAME"
 if [ ! -f "$EOAN_OS_RAW_IMAGE" ]; then
     pushd $WORKLOADS_DIR
-    time qemu-img convert -p -f qcow2 -O raw $EOAN_OS_IMAGE_NAME $EOAN_OS_RAW_IMAGE_NAME
+    time qemu-img convert -p -f qcow2 -O raw $EOAN_OS_IMAGE_NAME $EOAN_OS_RAW_IMAGE_NAME || exit 1
     popd
 fi
 
 pushd $WORKLOADS_DIR
-curl --silent "https://cloudhypervisorstorage.blob.core.windows.net/images/sha1sums" | sha1sum --check
+sha1sum sha1sums --check
 if [ $? -ne 0 ]; then
     echo "sha1sum validation of images failed, remove invalid images to fix the issue."
     exit 1
@@ -87,8 +89,8 @@ if [ ! -f "$VMLINUX_IMAGE" ]; then
     pushd $LINUX_CUSTOM_DIR
     cp $SRCDIR/resources/linux-virtio-fs-virtio-iommu-config .config
     time make bzImage -j `nproc`
-    cp vmlinux $VMLINUX_IMAGE
-    cp arch/x86/boot/bzImage $BZIMAGE_IMAGE
+    cp vmlinux $VMLINUX_IMAGE || exit 1
+    cp arch/x86/boot/bzImage $BZIMAGE_IMAGE || exit 1
     popd
     rm -rf $LINUX_CUSTOM_DIR
     popd
@@ -102,10 +104,10 @@ if [ ! -f "$VIRTIOFSD" ]; then
     pushd $QEMU_DIR
     time ./configure --prefix=$PWD --target-list=x86_64-softmmu
     time make virtiofsd -j `nproc`
-    cp virtiofsd $VIRTIOFSD
+    cp virtiofsd $VIRTIOFSD || exit 1
     popd
     rm -rf $QEMU_DIR
-    sudo setcap cap_dac_override,cap_sys_admin+epi "virtiofsd"
+    sudo setcap cap_dac_override,cap_sys_admin+epi "virtiofsd" || exit 1
     popd
 fi
 
@@ -117,7 +119,7 @@ if [ ! -f "$BLK_IMAGE" ]; then
    mkfs.ext4 -j $BLK_IMAGE
    mkdir $MNT_DIR
    sudo mount -t ext4 $BLK_IMAGE $MNT_DIR
-   sudo bash -c "echo bar > $MNT_DIR/foo"
+   sudo bash -c "echo bar > $MNT_DIR/foo" || exit 1
    sudo umount $BLK_IMAGE
    rm -r $MNT_DIR
    popd
@@ -127,7 +129,7 @@ SHARED_DIR="$WORKLOADS_DIR/shared_dir"
 if [ ! -d "$SHARED_DIR" ]; then
     mkdir -p $SHARED_DIR
     echo "foo" > "$SHARED_DIR/file1"
-    echo "bar" > "$SHARED_DIR/file3"
+    echo "bar" > "$SHARED_DIR/file3" || exit 1
 fi
 
 VFIO_DIR="$WORKLOADS_DIR/vfio"
@@ -135,7 +137,7 @@ rm -rf $VFIO_DIR
 mkdir -p $VFIO_DIR
 cp $CLEAR_OS_IMAGE $VFIO_DIR
 cp $FW $VFIO_DIR
-cp $VMLINUX_IMAGE $VFIO_DIR
+cp $VMLINUX_IMAGE $VFIO_DIR || exit 1
 
 # VFIO test network setup.
 # We reserve a different IP class for it: 172.17.0.0/24.
@@ -155,6 +157,15 @@ sudo ip tuntap add vfio-tap2 mode tap
 sudo ip link set vfio-tap2 master vfio-br0
 sudo ip link set vfio-tap2 up
 
+sudo ip tuntap add vfio-tap3 mode tap
+sudo ip link set vfio-tap3 master vfio-br0
+sudo ip link set vfio-tap3 up
+
+# Create tap interface without multipe queues support for vhost_user_net test.
+sudo ip tuntap add name vunet-tap0 mode tap
+# Create tap interface with multipe queues support for vhost_user_net test.
+sudo ip tuntap add name vunet-tap1 mode tap multi_queue
+
 cargo build --release
 sudo setcap cap_net_admin+ep target/release/cloud-hypervisor
 sudo setcap cap_net_admin+ep target/release/vhost_user_net
@@ -169,7 +180,7 @@ sudo bash -c "echo 10 > /sys/kernel/mm/ksm/sleep_millisecs"
 sudo bash -c "echo 1 > /sys/kernel/mm/ksm/run"
 
 # Ensure test binary has the same caps as the cloud-hypervisor one
-time cargo test --no-run --features "integration_tests" -- --nocapture
+time cargo test --no-run --features "integration_tests" -- --nocapture || exit 1
 ls target/debug/deps/cloud_hypervisor-* | xargs -n 1 sudo setcap cap_net_admin+ep
 
 # test_vfio relies on hugepages
@@ -201,5 +212,10 @@ sudo ip link del vfio-br0
 sudo ip link del vfio-tap0
 sudo ip link del vfio-tap1
 sudo ip link del vfio-tap2
+sudo ip link del vfio-tap3
+
+# Tear vhost_user_net test network down
+sudo ip link del vunet-tap0
+sudo ip link del vunet-tap1
 
 exit $RES
