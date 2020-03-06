@@ -19,7 +19,7 @@ unxz $HOME/workloads/clear-${IMG_VERSION}-kvm.img.xz
 # Make sure cloud-hypervisor binary has CAP_NET_ADMIN capability set
 sudo setcap cap_net_admin+ep cloud-hypervisor
 # Boot cloud-hypervisor VM with the downloaded image
-./cloud-hypervisor -v --kernel $HOME/workloads/vmlinux --disk path=clear-${IMG_VERSION}-kvm.img --cmdline "console=ttyS0 console=hvc0 reboot=k panic=1 nomodules root=/dev/vda3 rw" --cpus 1 --memory size=4G --net tap=,mac=
+./cloud-hypervisor -v --kernel $HOME/workloads/vmlinux --disk path=clear-${IMG_VERSION}-kvm.img --cmdline "console=ttyS0 console=hvc0 reboot=k panic=1 nomodules root=/dev/vda3 rw" --cpus boot=1 --memory size=4G --net tap=,mac=
 # Setup connectivity
 # First make sure to enable IP forwarding (disabled on Linux by default)
 sudo bash -c "echo 1 > /proc/sys/net/ipv4/ip_forward"
